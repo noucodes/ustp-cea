@@ -25,17 +25,29 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
 
 USERNAME = os.getenv("USERNAME1")
 PASSWORD = os.getenv("PASSWORD")
-PROG_ID = os.getenv("PROGID")
 
-if not USERNAME or not PASSWORD or not PROG_ID:
-    print("ERROR: Missing USERNAME1, PASSWORD, or PROGID in .env file!")
+if not USERNAME or not PASSWORD:
+    print("ERROR: Missing USERNAME1 or PASSWORD in .env file!")
     exit(1)
+
+# ---------------------
+# 2D DEPARTMENT CONFIG: [Display Name, Folder Name, PROG_ID]
+# ---------------------
+DEPARTMENTS = [
+    ("Civil Engineering",      "Civil_Engineering",      "eUd1UTFQVzZpbGtUTjFQUXl2T1dvdz09"),   # Replace with actual IDs
+    ("Architecture",           "Architecture",           "dkcwSThiVUcwcjl5Wit5blMzRVNQUT09"),
+    ("Mechanical Engineering", "Mechanical_Engineering", "MHBwWW05Zm9maVJDcXV5VWxqQ0JhZz09"),
+    ("Electrical Engineering", "Electrical_Engineering", "YXdMZWhIVTZLeGpRUTByM2RmRExEQT09"),
+    ("Computer Engineering",   "Computer_Engineering",   "cTFEaXV4RTUrQjkrT1VhMnp6aWNXQT09"),
+    ("Electronics Engineering","Electronics_Engineering","Qm9YMkNhSEIzZVY0blBFVUJNZTlDUT09"),
+    ("Geodetic Engineering",   "Geodetic_Engineering",   "aUYyZGF0S01QeHg1OTVVbEZUYXlwdz09"),
+]
 
 # ---------------------
 # Logging Setup
 # ---------------------
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-log_filename = f"scraper_and_process_{timestamp}.log"
+log_filename = f"scraper_{timestamp}.log"
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG_MODE else logging.INFO,
@@ -112,6 +124,7 @@ def categorize_year_level(year_text: str) -> str:
     else: return "Unknown"
 
 def save_jsonl(data: List[Dict], filename: str, mode: str = 'w'):
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     try:
         with open(filename, mode, encoding='utf-8') as f:
             for item in data:
@@ -151,15 +164,15 @@ def login() -> bool:
     return False
 
 # ---------------------
-# Fetch Enrollment
+# Fetch Enrollment for a specific program
 # ---------------------
-def fetch_enrollment() -> List[Dict]:
+def fetch_enrollment(prog_id: str) -> List[Dict]:
     params = {
         "event": "registered", "level": "-1", "term": "187", "campus": "1",
-        "progid": PROG_ID, "validation_status": "0", "section": "", "draw": "1",
+        "progid": prog_id, "validation_status": "0", "section": "", "draw": "1",
         "start": "0", "length": "-1", "_": str(int(time.time() * 1000))
     }
-    headers = {"X-CSRF-TOKEN": get_fresh_csrf(session), "X-Requested-With": "XMLHttpRequest"}
+    headers = {"X-CSRF-TOKEN": get_fresh_csrf(session) or "", "X-Requested-With": "XMLHttpRequest"}
 
     try:
         resp = session.get(ENROLLMENT_URL, params=params, headers=headers, timeout=20)
@@ -169,11 +182,11 @@ def fetch_enrollment() -> List[Dict]:
         logger.info(f"Fetched {len(students)} enrolled students")
         return students
     except Exception as e:
-        logger.error(f"Enrollment fetch failed: {e}")
+        logger.error(f"Enrollment fetch failed for progid {prog_id}: {e}")
         return []
 
 # ---------------------
-# Fetch Grades (Worker)
+# Fetch Grades (Worker - per student)
 # ---------------------
 def fetch_student_grades(encoded_id: str) -> List[Dict]:
     worker_session = requests.Session()
@@ -183,8 +196,10 @@ def fetch_student_grades(encoded_id: str) -> List[Dict]:
     if not csrf:
         return []
 
-    # Login worker
-    worker_session.post(LOGIN_URL, data={"_token": csrf, "Username": USERNAME, "password": PASSWORD})
+    try:
+        worker_session.post(LOGIN_URL, data={"_token": csrf, "Username": USERNAME, "password": PASSWORD}, timeout=15)
+    except:
+        return []
 
     payload = {"_token": csrf, "event": "load-grades", "progClass": "50", "idno": encoded_id}
     headers = {"X-CSRF-TOKEN": csrf, "X-Requested-With": "XMLHttpRequest"}
@@ -213,7 +228,7 @@ def fetch_student_grades(encoded_id: str) -> List[Dict]:
         return []
 
 # ---------------------
-# POST-PROCESSING: Fix Duplicates + Classify Status
+# Post-processing: duplicates + status
 # ---------------------
 def is_irregular_grade(grade_val: Any) -> bool:
     g = str(grade_val).strip()
@@ -231,7 +246,6 @@ def fix_duplicates_and_classify(student: Dict) -> Dict:
     student_id = student.get("student_id", "Unknown")
     name = student.get("name", "No name")
 
-    # Fix duplicates: keep last occurrence
     seen = defaultdict(list)
     for i, g in enumerate(grades):
         code = g.get("subject_code", "").strip().upper()
@@ -261,92 +275,126 @@ def fix_duplicates_and_classify(student: Dict) -> Dict:
     return student
 
 # ---------------------
-# Main Execution
+# Main Execution - Multi-Department Loop
 # ---------------------
 def main():
-    logger.info("USTP Grades Scraper + Processor v3.0 - Starting...")
+    logger.info("USTP Multi-Department Grades Scraper v4.0 - Starting...")
 
     if not login():
         return
 
-    students_raw = fetch_enrollment()
-    if not students_raw:
-        logger.error("No students fetched. Exiting.")
-        return
+    base_output_dir = "scraped_data"
+    os.makedirs(base_output_dir, exist_ok=True)
 
-    # Categorize by year
-    students_by_year = defaultdict(list)
-    for s in students_raw:
-        info = extract_student_info(s)
-        if info.get("encoded_id"):
-            students_by_year[info["year_level"]].append(info)
+    global_summary = {}
 
-    logger.info(f"Students by year: {dict((k, len(v)) for k, v in students_by_year.items() if v)}")
+    for dept_name, folder_name, prog_id in DEPARTMENTS:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"PROCESSING DEPARTMENT: {dept_name} ({prog_id})")
+        logger.info(f"{'='*80}")
 
-    # Scrape grades concurrently
-    raw_records = []
-    total = sum(len(v) for v in students_by_year.values())
-    processed = 0
+        dept_folder = os.path.join(base_output_dir, folder_name)
+        os.makedirs(dept_folder, exist_ok=True)
 
-    tasks = []
-    for year, infos in students_by_year.items():
-        for info in infos:
-            tasks.append((info, year))
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-    raw_filename = f"grades_complete_{timestamp_str}.jsonl"
-    final_filename = f"grades_final_with_status_{timestamp_str}.jsonl"
+        enrollment_file = os.path.join(dept_folder, f"enrollment_{timestamp_str}.jsonl")
+        raw_grades_file = os.path.join(dept_folder, f"grades_complete_{timestamp_str}.jsonl")
+        final_grades_file = os.path.join(dept_folder, f"grades_final_with_status_{timestamp_str}.jsonl")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_student_grades, info["encoded_id"]): info for info, _ in tasks}
+        # Fetch enrollment for this department
+        students_raw = fetch_enrollment(prog_id)
+        if not students_raw:
+            logger.warning(f"No students found for {dept_name}. Skipping.")
+            global_summary[dept_name] = {"students": 0, "regular": 0, "irregular": 0}
+            continue
 
-        for future in as_completed(futures):
-            info = futures[future]
-            processed += 1
-            grades = future.result()
+        # Save enrollment list
+        enrollment_data = [extract_student_info(s) for s in students_raw]
+        save_jsonl(enrollment_data, enrollment_file, 'w')
+        logger.info(f"Enrollment saved: {enrollment_file}")
 
-            record = {
-                "student_id": info["student_id"],
-                "name": info["name"],
-                "course": info["course"],
-                "year_level": info["year_level"],
-                "total_subjects": len(grades),
-                "grades": grades
-            }
-            raw_records.append(record)
-            save_jsonl([record], raw_filename, 'a')
+        # Prepare tasks
+        tasks = []
+        students_by_year = defaultdict(list)
+        for s in students_raw:
+            info = extract_student_info(s)
+            if info.get("encoded_id"):
+                students_by_year[info["year_level"]].append(info)
+                tasks.append(info)
 
-            logger.info(f"[{processed}/{total}] Fetched grades: {info['student_id']} - {len(grades)} subjects")
+        total = len(tasks)
+        if total == 0:
+            logger.warning(f"No valid encoded_id found for {dept_name}")
+            continue
 
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+        logger.info(f"Starting grade scraping for {total} students in {dept_name}")
 
-    # Save raw complete data
-    save_jsonl(raw_records, raw_filename, 'w')
-    logger.info(f"Raw grades saved: {raw_filename}")
+        raw_records = []
+        processed = 0
 
-    # Process: fix duplicates + classify status
-    logger.info("Starting post-processing: fixing duplicates + classifying status...")
-    final_records = [fix_duplicates_and_classify(r) for r in raw_records]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(fetch_student_grades, info["encoded_id"]): info for info in tasks}
 
-    # Save final enriched data
-    save_jsonl(final_records, final_filename, 'w')
+            for future in as_completed(futures):
+                info = futures[future]
+                processed += 1
+                grades = future.result()
 
-    # Final summary
-    regular = sum(1 for r in final_records if r.get("enrollment_status") == "Regular")
-    irregular = len(final_records) - regular
+                record = {
+                    "student_id": info["student_id"],
+                    "name": info["name"],
+                    "course": info["course"],
+                    "year_level": info["year_level"],
+                    "total_subjects": len(grades),
+                    "grades": grades
+                }
+                raw_records.append(record)
+                save_jsonl([record], raw_grades_file, 'a')
 
-    print("\n" + "="*80)
-    print("SCRAPING & PROCESSING COMPLETED SUCCESSFULLY")
-    print("="*80)
-    print(f"Raw data:           {raw_filename}")
-    print(f"Final data:         {final_filename}")
-    print(f"Total students:     {len(final_records)}")
-    print(f"   Regular:         {regular}")
-    print(f"   Irregular:       {irregular}")
-    print(f"Log file:           {log_filename}")
-    print("="*80)
+                logger.info(f"[{dept_name}] [{processed}/{total}] {info['student_id']} → {len(grades)} subjects")
 
-    logger.info("All done!")
+                time.sleep(DELAY_BETWEEN_REQUESTS)
+
+        # Save raw grades
+        save_jsonl(raw_records, raw_grades_file, 'w')
+
+        # Post-process
+        logger.info(f"Post-processing {dept_name} data...")
+        final_records = [fix_duplicates_and_classify(r) for r in raw_records]
+        save_jsonl(final_records, final_grades_file, 'w')
+
+        # Department summary
+        regular = sum(1 for r in final_records if r.get("enrollment_status") == "Regular")
+        irregular = len(final_records) - regular
+
+        global_summary[dept_name] = {
+            "students": len(final_records),
+            "regular": regular,
+            "irregular": irregular
+        }
+
+        print(f"\n>>> {dept_name} COMPLETED")
+        print(f"    Students: {len(final_records)} | Regular: {regular} | Irregular: {irregular}")
+        print(f"    Files saved in: ./{dept_folder}")
+
+    # Global final summary
+    print("\n" + "="*100)
+    print("ALL DEPARTMENTS PROCESSED SUCCESSFULLY")
+    print("="*100)
+    total_students = sum(d["students"] for d in global_summary.values())
+    total_regular = sum(d["regular"] for d in global_summary.values())
+    total_irregular = sum(d["irregular"] for d in global_summary.values())
+
+    print(f"TOTAL ACROSS ALL DEPARTMENTS")
+    print(f"   Students:     {total_students}")
+    print(f"   Regular:      {total_regular}")
+    print(f"   Irregular:    {total_irregular}")
+    print(f"Log file:        {log_filename}")
+    print(f"Output folder:   ./scraped_data/")
+    print("="*100)
+
+    logger.info("Multi-department scraping completed!")
 
 if __name__ == "__main__":
     try:
